@@ -1,1 +1,2644 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+"""
+RET — RED INTELIGENTE PERSISTENTE
+
+Operaciones reales originales (intactas):
+- HTTP real entre nodos
+- SQLite persistente
+- Identidad Ed25519 persistente
+- Cifrado autenticado Fernet
+- Ping real y RTT real
+- Heartbeats reales
+- ACK reales
+- Reintentos / TTL / Deduplicación
+- Historial persistente
+- Tabla de rutas basada en resultados reales
+- Registro de eventos consultable
+- Eliminación de nodos
+- Ping a todos los nodos
+- Exportación de estado a JSON
+- Apagado limpio por señal SIGTERM
+
+Capa P2P completa integrada (NUEVO P2P — nada eliminado ni modificado):
+- Descubrimiento automático LAN por UDP multicast sin config
+- Intercambio de peers (PEX) — la red crece sola
+- Gossip epidémico — un mensaje alcanza millones en pocos saltos
+- DHT Kademlia simplificado — enrutamiento sin servidor central
+- Bootstrap — entrada a la red mundial por nodos conocidos
+- Endpoints HTTP nuevos: /peers, GOSSIP_RET, PEER_EXCHANGE, DHT_FIND_NODE
+- Tarjeta de conexión + código QR (como código de entrenador)
+
+Autor del proyecto: Evelio José Llovera Pantoja
+"""
+
+import base64
+import collections
+import datetime
+import hashlib
+import ipaddress
+import json
+import math
+import os
+import random
+import re
+import secrets
+import signal
+import socket
+import sqlite3
+import ssl
+import struct
+import sys
+import threading
+import time
+import uuid
+import zlib
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
+from urllib.parse import urlsplit, parse_qs
+
+# Imports para cifrado E2E real (X25519 + HKDF)
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes as crypto_hashes
+
+# Imports para el certificado TLS autofirmado del dashboard (videollamada:
+# el navegador exige HTTPS o localhost para dar acceso a cámara/micrófono)
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        PrivateFormat,
+        PublicFormat,
+        NoEncryption,
+    )
+except ImportError:
+    print("")
+    print("ERROR: falta la librería cryptography")
+    print("")
+    print("Instala con:")
+    print("pip install cryptography")
+    raise SystemExit(1)
+
+# NUEVO: librería opcional para dibujar el QR (imagen y terminal)
+try:
+    import qrcode
+    QR_DISPONIBLE = True
+except ImportError:
+    QR_DISPONIBLE = False
+
+# NUEVO: transporte Bluetooth (opcional, sin WiFi/LAN).
+# Requiere PyBluez + BlueZ — solo funciona en Linux con bluetoothd activo.
+# En Windows no está soportado. En Android/Termux no funciona sin root:
+# Android no expone sockets RFCOMM crudos a apps normales.
+try:
+    import bluetooth  # PyBluez
+    BT_DISPONIBLE = True
+except ImportError:
+    BT_DISPONIBLE = False
+
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+NOMBRE_SISTEMA = "RET"
+VERSION = "3.1-P2P-QR"
+
+# ============================================================
+# IDENTIDAD VISUAL DE RET — colores, logo, huella, firma
+# ============================================================
+
+class C:
+    """
+    Colores ANSI para terminal.
+    Sin dependencias externas — funciona en cualquier terminal moderna.
+    Degradar limpiamente si el terminal no soporta color.
+    """
+    RESET    = "\033[0m"
+    BOLD     = "\033[1m"
+    DIM      = "\033[2m"
+    AZUL     = "\033[94m"
+    VERDE    = "\033[92m"
+    CYAN     = "\033[96m"
+    AMARILLO = "\033[93m"
+    ROJO     = "\033[91m"
+    BLANCO   = "\033[97m"
+    GRIS     = "\033[90m"
+    MAGENTA  = "\033[95m"
+
+    @staticmethod
+    def ok(t):      return f"\033[92m{t}\033[0m"
+    @staticmethod
+    def error(t):   return f"\033[91m{t}\033[0m"
+    @staticmethod
+    def warn(t):    return f"\033[93m{t}\033[0m"
+    @staticmethod
+    def info(t):    return f"\033[96m{t}\033[0m"
+    @staticmethod
+    def dim(t):     return f"\033[90m{t}\033[0m"
+    @staticmethod
+    def bold(t):    return f"\033[1m{t}\033[0m"
+    @staticmethod
+    def titulo(t):  return f"\033[1m\033[94m{t}\033[0m"
+    @staticmethod
+    def firma(t):   return f"\033[1m\033[95m{t}\033[0m"
+    @staticmethod
+    def enc(t):     return f"\033[92m\033[1m{t}\033[0m"
+
+
+LOGO_RET = f"""
+{C.AZUL}{C.BOLD}\
+  ██████╗ ███████╗████████╗
+  ██╔══██╗██╔════╝╚══██╔══╝
+  ██████╔╝█████╗     ██║
+  ██╔══██╗██╔══╝     ██║
+  ██║  ██║███████╗   ██║
+  ╚═╝  ╚═╝╚══════╝   ╚═╝{C.RESET}
+{C.CYAN}  Red Inteligente Persistente — v{VERSION}
+  Autor: Evelio José Llovera Pantoja{C.RESET}
+"""
+
+
+def huella_visual(node_id):
+    """
+    Huella visual única del nodo — como una firma en bloques.
+    Generada desde el node_id: mismo ID → misma huella siempre.
+    Ningún otro nodo en el mundo tiene la misma.
+    """
+    h      = hashlib.sha256(node_id.encode()).hexdigest()
+    grises = [" ", "░", "▒", "▓", "█"]
+    lineas = []
+    for fila in range(4):
+        linea = ""
+        for col in range(8):
+            v = int(h[fila * 8 + col], 16)
+            linea += grises[v % len(grises)] * 2
+        lineas.append(linea)
+    return lineas
+
+
+def imprimir_huella(node_id, nombre):
+    """Muestra la huella visual del nodo con marco."""
+    filas = huella_visual(node_id)
+    ancho = len(filas[0])
+    print(f"  {C.GRIS}┌{'─' * ancho}┐{C.RESET}")
+    for f in filas:
+        print(f"  {C.GRIS}│{C.RESET}{C.CYAN}{f}{C.RESET}{C.GRIS}│{C.RESET}")
+    print(f"  {C.GRIS}└{'─' * ancho}┘{C.RESET}")
+    print(f"  {C.DIM}{node_id}{C.RESET}")
+
+
+# Firma de protocolo RET — presente en todos los paquetes
+FIRMA_PROTOCOLO = f"RET/{VERSION}"
+
+BASE = Path.home() / "RET"
+BASE.mkdir(parents=True, exist_ok=True)
+
+DB_PATH        = BASE / "ret.db"
+IDENTIDAD_PATH = BASE / "identidad.json"
+EXPORT_PATH    = BASE / "export_estado.json"
+TLS_CERT_PATH  = BASE / "dashboard_tls_cert.pem"
+TLS_KEY_PATH   = BASE / "dashboard_tls_key.pem"
+PUENTES_PATH   = BASE / "puentes.json"
+
+# ---- Mapa real offline (opcional) ----
+# Carpeta donde el usuario coloca, UNA VEZ y con internet, los archivos
+# necesarios para tener un mapa real de calles funcionando después sin
+# conexión: la librería MapLibre GL (JS+CSS) y un archivo .pmtiles de
+# su región (se genera/descarga con herramientas como protomaps.com).
+# Si esta carpeta no tiene esos archivos, el dashboard sigue funcionando
+# igual pero muestra el mapa de malla decorativo (cuadrícula propia) en
+# vez del mapa real — nunca se rompe por falta de estos archivos.
+MAPA_OFFLINE_DIR = BASE / "mapa_offline"
+MAPA_OFFLINE_DIR.mkdir(parents=True, exist_ok=True)
+MAPA_OFFLINE_ARCHIVOS = {
+    "maplibre-gl.js":  "text/javascript",
+    "maplibre-gl.css": "text/css",
+    "pmtiles.js":      "text/javascript",
+    "mapa.pmtiles":    "application/octet-stream",
+}
+
+# Tipos de tile del header PMTiles v3 (byte en offset 0x63, ver spec.md cap.3)
+_PMTILES_TIPOS_VECTOR = {1, 6}   # MVT / MapLibre Vector Tile
+_PMTILES_TIPOS_RASTER = {2, 3, 4, 5}  # PNG / JPEG / WebP / AVIF
+
+
+def leer_cabecera_pmtiles(ruta):
+    """
+    Lee SOLO los 127 bytes fijos del header de un archivo .pmtiles (spec v3)
+    para saber, sin descargar ni depender de internet, si el mapa es vector
+    o raster y cuál es su zoom/centro por defecto — así el usuario no tiene
+    que escribir coordenadas a mano en ningún lado ("mínimos detalles").
+    Devuelve None si el archivo no es un pmtiles v3 válido.
+    """
+    try:
+        with open(ruta, "rb") as f:
+            cab = f.read(127)
+        if len(cab) < 127 or cab[0:7] != b"PMTiles":
+            return None
+        version = cab[7]
+        tile_type = cab[0x63]
+        min_zoom  = cab[0x64]
+        max_zoom  = cab[0x65]
+        centro_zoom = cab[0x76]
+        centro_lon  = struct.unpack_from("<i", cab, 0x77)[0] / 1e7
+        centro_lat  = struct.unpack_from("<i", cab, 0x7B)[0] / 1e7
+
+        if tile_type in _PMTILES_TIPOS_VECTOR:
+            tipo = "vector"
+        elif tile_type in _PMTILES_TIPOS_RASTER:
+            tipo = "raster"
+        else:
+            tipo = "desconocido"
+
+        return {
+            "version": version,
+            "tipo": tipo,
+            "zoom_min": min_zoom,
+            "zoom_max": max_zoom,
+            "centro_zoom": centro_zoom,
+            "centro_lon": centro_lon,
+            "centro_lat": centro_lat,
+        }
+    except Exception:
+        return None
+LOCK           = threading.RLock()
+
+# Parámetros originales — configurables por variable de entorno
+HEARTBEAT_INTERVAL   = int(os.environ.get("RET_HEARTBEAT_INTERVAL",   15))
+PING_TIMEOUT         = int(os.environ.get("RET_PING_TIMEOUT",          5))
+MAX_REINTENTOS       = int(os.environ.get("RET_MAX_REINTENTOS",         3))
+TTL_DEFAULT          = int(os.environ.get("RET_TTL_DEFAULT",            8))
+HTTP_REQUEST_QUEUE_SIZE = int(os.environ.get("RET_REQUEST_QUEUE_SIZE", 256))
+
+# NUEVO P2P: parámetros de la capa P2P — todos configurables por entorno
+GOSSIP_FANOUT          = int(os.environ.get("RET_GOSSIP_FANOUT",          5))
+GOSSIP_TTL             = int(os.environ.get("RET_GOSSIP_TTL",            30))
+UDP_DISCOVERY_PORT     = int(os.environ.get("RET_UDP_PORT",            7778))
+UDP_MULTICAST_GROUP    = "224.0.0.251"
+UDP_ANNOUNCE_INTERVAL  = int(os.environ.get("RET_UDP_ANNOUNCE",         30))
+DHT_K                  = int(os.environ.get("RET_DHT_K",                20))
+PEER_EXCHANGE_INTERVAL = int(os.environ.get("RET_PEX_INTERVAL",         30))
+
+# Hilos paralelos para envíos simultáneos de HTTP
+EXECUTOR_WORKERS = int(os.environ.get("RET_WORKERS", 64))
+
+# Bootstrap: "host:puerto,host:puerto" separados por coma
+_bootstrap_env  = os.environ.get("RET_BOOTSTRAP", "")
+BOOTSTRAP_NODES = [n.strip() for n in _bootstrap_env.split(",") if n.strip()]
+
+# Puentes de internet — cada cuánto se reintenta conectar con los nodos
+# puente configurados a mano (ver GestorPuentes). El propio mecanismo de
+# bootstrap (arriba) ya sabe hablar con CUALQUIER host:puerto alcanzable,
+# sea LAN o internet, porque el transporte de RET es HTTP/TCP normal —
+# lo único que faltaba era reintentarlo periódicamente en vez de una
+# sola vez al arrancar, y un lugar donde guardar esa lista entre
+# reinicios sin depender de variables de entorno.
+PUENTE_INTERVALO = int(os.environ.get("RET_PUENTE_INTERVALO", 60))
+
+# Mensajes anclados geolocalizados ("dejados atrás")
+ANCLA_REVISION_INTERVALO   = int(os.environ.get("RET_ANCLA_INTERVALO", 30))
+ANCLA_VIGENCIA_DEFECTO_DIAS = int(os.environ.get("RET_ANCLA_DIAS_DEFECTO", 7))
+
+# Fotos y videos en el chat — tamaño máximo por archivo (MB)
+MEDIA_TAMANO_MAXIMO_MB = int(os.environ.get("RET_MEDIA_MAX_MB", 20))
+MEDIA_TAMANO_MAXIMO    = MEDIA_TAMANO_MAXIMO_MB * 1024 * 1024
+
+# Nodo testigo — prueba de contacto firmada
+TESTIGO_DISTANCIA_MAXIMA_KM = float(os.environ.get("RET_TESTIGO_DISTANCIA_KM", 0.3))  # ~300m: "alcance válido"
+TESTIGO_COOLDOWN_HORAS      = float(os.environ.get("RET_TESTIGO_COOLDOWN_HORAS", 6))
+TESTIGO_VENTANA_REPLAY_SEG  = int(os.environ.get("RET_TESTIGO_VENTANA_SEG", 120))
+TESTIGO_REVISION_INTERVALO  = int(os.environ.get("RET_TESTIGO_INTERVALO", 60))
+
+# Orden EXACTO y fijo de los campos que se firman — tiene que ser
+# idéntico en quien propone, quien contrafirma, y quien solo verifica
+# al recibir por gossip. Si este orden cambiara entre versiones, firmas
+# viejas dejarían de verificar — se deja como constante única a
+# propósito, para que nunca se defina dos veces por separado.
+TESTIGO_CAMPOS_FIRMABLES = (
+    "tipo", "id_testigo", "nodo_a", "nodo_b", "tiempo_utc",
+    "ubicacion_a", "ubicacion_b", "distancia_km",
+    "adjunto_tipo", "adjunto_id",
+)
+
+# Juego Encuentro (escondidas con pistas frío/tibio/caliente)
+JUEGO_UMBRAL_FRIO_M       = float(os.environ.get("RET_JUEGO_FRIO_M", 200))
+JUEGO_UMBRAL_TIBIO_M      = float(os.environ.get("RET_JUEGO_TIBIO_M", 50))
+JUEGO_UMBRAL_ENCONTRADO_M = float(os.environ.get("RET_JUEGO_ENCONTRADO_M", 8))
+JUEGO_MAX_DESPISTES_DEFECTO = int(os.environ.get("RET_JUEGO_MAX_DESPISTES", 3))
+JUEGO_LATIDO_INTERVALO_SEG = int(os.environ.get("RET_JUEGO_LATIDO_SEG", 20))
+JUEGO_JUGADOR_TTL_SEG      = int(os.environ.get("RET_JUEGO_JUGADOR_TTL_SEG", 60))
+
+JUEGO_CAMPOS_FIRMABLES = (
+    "tipo", "partida_id", "nombre_partida", "escondido", "escondido_nombre",
+    "encontrado_por", "encontrado_por_nombre", "tiempo_utc",
+    "lat", "lon", "despistes_usados",
+)
+
+# Vinculación segura — código corto + confirmación criptográfica Ed25519
+VINCULACION_CODIGO_LEN         = 6
+VINCULACION_CODIGO_ALFABETO    = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # sin 0/O/1/I para no confundir
+VINCULACION_EXPIRA_CODIGO_SEG  = int(os.environ.get("RET_VINC_CODIGO_SEG", 600))  # 10 minutos
+VINCULACION_DURACIONES = {
+    "1d": 86400, "7d": 7 * 86400, "30d": 30 * 86400, "indefinida": None,
+}
+VINCULACION_CAMPOS_FIRMABLES = (
+    "tipo", "codigo", "nodo_a", "nodo_b", "duracion", "tiempo_utc", "expira_sesion",
+)
+
+# ── Capacidades nuevas ──────────────────────────────────────
+CHUNK_SIZE         = int(os.environ.get("RET_CHUNK_SIZE",   65536))
+STORE_FORWARD_TTL  = int(os.environ.get("RET_SF_TTL",          24))
+REP_INICIAL        = int(os.environ.get("RET_REP_INICIAL",    500))
+API_KEY            = os.environ.get("RET_API_KEY", "")
+DASHBOARD_REFRESH  = int(os.environ.get("RET_DASH_REFRESH",     5))
+
+# ── Malla de gossip acotada (inspirada en GossipSub de libp2p) ──
+# Tamaño objetivo de vecinos de malla por nodo — el costo de propagar
+# un mensaje es SIEMPRE ~este número, sin importar cuántos peers
+# conozca el nodo en total (a diferencia del gossip "ingenuo" original,
+# que resampleaba de todo el pool en cada mensaje).
+MESH_DEGREE       = int(os.environ.get("RET_MESH_DEGREE",       6))
+MESH_DEGREE_BAJO  = int(os.environ.get("RET_MESH_DEGREE_BAJO",  4))
+MESH_DEGREE_ALTO  = int(os.environ.get("RET_MESH_DEGREE_ALTO", 12))
+MESH_HEARTBEAT    = int(os.environ.get("RET_MESH_HEARTBEAT",   30))
+
+# ── Modo del nodo: COMPLETO participa en la malla de gossip y en el
+#    DHT (hace de relevo para otros); LIGERO solo manda/recibe lo
+#    suyo — pensado para móviles con batería/datos limitados que no
+#    quieren cargar con el tráfico de reenvío de toda la red.
+MODOS_NODO_VALIDOS = ("completo", "ligero")
+
+# ── Dashboard por HTTPS (requerido por el navegador para dar acceso a
+#    cámara/micrófono en videollamada, salvo en localhost). Servidor
+#    aparte del HTTP del protocolo P2P — ese no se toca.
+DASH_TLS_PORT_OFFSET = int(os.environ.get("RET_DASH_TLS_OFFSET", 1))
+
+# ── Bluetooth (transporte alterno sin WiFi/LAN) ─────────────
+RET_BT_UUID       = "94f39d29-7d6d-437d-973b-fba39e49d4ee"
+BT_SCAN_DURATION  = int(os.environ.get("RET_BT_SCAN_DURATION",  8))
+BT_SCAN_INTERVAL  = int(os.environ.get("RET_BT_SCAN_INTERVAL", 60))
+
+
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+def ahora():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+def ahora_epoch():
+    return time.time()
+
+def json_bytes(datos):
+    return json.dumps(datos, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+def hash_sha256(texto):
+    return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+def verificar_firma(datos, firma_b64, clave_publica_b64):
+    """
+    Verifica una firma Ed25519 sobre `datos` (mismo formato exacto que
+    usa IdentidadNodo.firmar). Devuelve False ante cualquier problema
+    (firma inválida, clave corrupta, etc.) — nunca lanza excepción hacia
+    afuera, porque esto se llama sobre datos que llegan de la red y no
+    deben poder tumbar el proceso.
+    """
+    try:
+        clave = Ed25519PublicKey.from_public_bytes(base64.b64decode(clave_publica_b64))
+        clave.verify(base64.b64decode(firma_b64), json_bytes(datos))
+        return True
+    except Exception:
+        return False
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Distancia real entre dos coordenadas (línea recta sobre la
+    superficie terrestre) — el mismo cálculo que ya se usa en el radar
+    del dashboard (ahí en JavaScript), aquí en Python para el backend."""
+    r = 6371.0
+    fi1, fi2 = math.radians(lat1), math.radians(lat2)
+    dfi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dfi/2)**2 + math.cos(fi1)*math.cos(fi2)*math.sin(dlam/2)**2
+    return 2 * r * math.asin(math.sqrt(a))
+
+# ── Red local — sin internet ──────────────────────────────────
+
+def mis_ips_locales():
+    """
+    Retorna todas las IPs locales de esta máquina.
+    Sin DNS externo, sin internet — solo interfaces del sistema.
+    Funciona en LAN, hotspot, cable directo, red ad-hoc.
+    """
+    ips = set()
+
+    try:
+        hostname = socket.gethostname()
+        _, _, addrs = socket.gethostbyname_ex(hostname)
+        for ip in addrs:
+            if not ip.startswith("127."):
+                ips.add(ip)
+    except Exception:
+        pass
+
+    try:
+        for res in socket.getaddrinfo(socket.gethostname(), None):
+            ip = res[4][0]
+            if not ip.startswith("127.") and ":" not in ip:
+                ips.add(ip)
+    except Exception:
+        pass
+
+    for destino_ficticio in ["10.255.255.255", "192.168.255.255", "172.16.255.255"]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((destino_ficticio, 1))
+            ip = s.getsockname()[0]
+            s.close()
+            if not ip.startswith("127."):
+                ips.add(ip)
+        except Exception:
+            pass
+
+    return sorted(ips) or ["127.0.0.1"]
+
+
+def subred_base(ip):
+    """Retorna la base de la subred: '192.168.1.5' → '192.168.1'"""
+    partes = ip.rsplit(".", 1)
+    return partes[0] if len(partes) == 2 else ip
+
+
+def pin_nodo(node_id):
+    """
+    PIN de 6 dígitos derivado del node_id.
+    Determinístico: mismo node_id → mismo PIN siempre.
+    """
+    valor = int(hashlib.sha256(node_id.encode()).hexdigest()[:8], 16)
+    return f"{valor % 1_000_000:06d}"
+
+def xor_distancia(id1, id2):
+    """
+    Distancia XOR entre dos node_id RET.
+    Resultado menor = nodos más cercanos en el espacio DHT.
+    """
+    def a_int(nid):
+        parte = nid.split("-")[-1] if "-" in nid else nid
+        try:
+            return int(parte, 16)
+        except ValueError:
+            return int(hashlib.sha256(nid.encode()).hexdigest()[:16], 16)
+    return a_int(id1) ^ a_int(id2)
+
+
+def obtener_certificado_tls(nombre_nodo):
+    """
+    Genera (o reutiliza si ya existe) un certificado TLS autofirmado
+    para el dashboard, usando la misma librería 'cryptography' que ya
+    usa RET para Ed25519/X25519 — sin depender de openssl externo.
+
+    El navegador exige HTTPS (o localhost) para dar acceso a cámara y
+    micrófono; sin este certificado, la videollamada no puede pedir
+    permiso de cámara desde ningún dispositivo que no sea el propio
+    localhost. El certificado es autofirmado: el navegador mostrará una
+    advertencia de "conexión no segura" la primera vez — es normal y
+    esperado en una red local propia, se acepta una vez y ya.
+
+    Devuelve (ruta_cert, ruta_clave).
+    """
+    if TLS_CERT_PATH.exists() and TLS_KEY_PATH.exists():
+        return TLS_CERT_PATH, TLS_KEY_PATH
+
+    clave = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    nombre_sujeto = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, f"RET-{nombre_nodo}"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "RET - Red Inteligente Persistente"),
+    ])
+
+    # Certificado válido para todas las IPs locales + localhost, así
+    # sirve tanto para pruebas propias como para otros nodos de la LAN.
+    nombres_alt = [x509.DNSName("localhost")]
+    try:
+        nombres_alt.append(x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")))
+    except Exception:
+        pass
+    for ip_local in mis_ips_locales():
+        try:
+            nombres_alt.append(x509.IPAddress(ipaddress.IPv4Address(ip_local)))
+        except Exception:
+            pass
+
+    ahora_dt = datetime.datetime.utcnow()
+    certificado = (
+        x509.CertificateBuilder()
+        .subject_name(nombre_sujeto)
+        .issuer_name(nombre_sujeto)  # autofirmado: emisor = sujeto
+        .public_key(clave.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(ahora_dt - datetime.timedelta(days=1))
+        .not_valid_after(ahora_dt + datetime.timedelta(days=3650))  # 10 años
+        .add_extension(x509.SubjectAlternativeName(nombres_alt), critical=False)
+        .sign(clave, crypto_hashes.SHA256())
+    )
+
+    TLS_KEY_PATH.write_bytes(clave.private_bytes(
+        encoding=Encoding.PEM,
+        format=PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=NoEncryption(),
+    ))
+    TLS_CERT_PATH.write_bytes(certificado.public_bytes(Encoding.PEM))
+
+    return TLS_CERT_PATH, TLS_KEY_PATH
+
+
+# ============================================================
+# CONTADOR DE SESIÓN — mensajes y archivos desde el arranque
+# ============================================================
+
+class ContadorSesion:
+    def __init__(self):
+        self.inicio             = ahora_epoch()
+        self.msgs_enviados      = 0
+        self.msgs_recibidos     = 0
+        self.gossip_propagados  = 0
+        self.archivos_enviados  = 0
+        self._lock              = threading.Lock()
+
+    def incr(self, campo):
+        with self._lock:
+            setattr(self, campo, getattr(self, campo) + 1)
+
+    def resumen(self):
+        uptime = int(ahora_epoch() - self.inicio)
+        h = uptime // 3600
+        m = (uptime % 3600) // 60
+        s = uptime % 60
+        return {
+            "uptime":           f"{h:02d}:{m:02d}:{s:02d}",
+            "msgs_enviados":    self.msgs_enviados,
+            "msgs_recibidos":   self.msgs_recibidos,
+            "gossip_propagados": self.gossip_propagados,
+            "archivos_enviados": self.archivos_enviados,
+        }
+
+
+# ============================================================
+# SINCRONIZADOR DE TIEMPO LOCAL — hora exacta sin internet
+# ============================================================
+
+class SincronizadorTiempo:
+    def __init__(self, nodo, cliente):
+        self.nodo         = nodo
+        self.cliente      = cliente
+        self.offset_s     = 0.0
+        self.sincronizado = False
+        self.fuente       = ""
+
+    def sincronizar_con(self, host, puerto):
+        t1 = ahora_epoch()
+        ok, resp, rtt = self.cliente.enviar_http(
+            host, puerto,
+            {"tipo": "TIME_SYNC", "t1": t1},
+            timeout=3
+        )
+        if not ok or "t2" not in resp:
+            return False
+
+        t2          = resp["t2"]
+        rtt_s       = rtt / 1000.0
+        self.offset_s = t2 - (t1 + rtt_s / 2)
+        self.sincronizado = True
+        self.fuente       = f"{host}:{puerto}"
+        self.nodo.db.evento(
+            "TIME_SYNC",
+            f"fuente={self.fuente} offset={self.offset_s*1000:.1f}ms"
+        )
+        return True
+
+    def tiempo_local(self):
+        return ahora_epoch() + self.offset_s
+
+    def estado_str(self):
+        if self.sincronizado:
+            return f"⏱ Sincronizado ({self.offset_s*1000:+.1f}ms vs {self.fuente})"
+        return "⏱ Reloj local (no sincronizado)"
+
+
+# ============================================================
+# ESTADO VISUAL — barra de estado en pantalla
+# ============================================================
+
+def barra_estado(nodo, red_p2p, contador, sincro):
+    """Barra de estado visual con colores antes de cada menú."""
+    r = contador.resumen()
+
+    peers_total = (nodo.db.contar_peers_p2p()
+                   + len(nodo.db.listar_nodos()))
+
+    conectado = (C.ok(f"✅ {peers_total} peer(s)")
+                 if peers_total > 0
+                 else C.error("🔴 Sin peers"))
+    cifrado   = C.enc("🔒 E2E")
+    sin_inet  = C.warn("📶 Sin internet")
+    malla_n   = red_p2p.malla_gossip.tamano() if red_p2p else 0
+    malla_txt = C.info(f"🕸 malla {malla_n}/{MESH_DEGREE}")
+    ts        = sincro.estado_str() if sincro else "⏱ Reloj local"
+
+    print()
+    print(C.DIM + "  ┌───────────────────────────────────────────────────┐" + C.RESET)
+    print(f"  {C.DIM}│{C.RESET}  {conectado}   {cifrado}   {sin_inet}"
+          + " " * 4 + C.DIM + "│" + C.RESET)
+    print(f"  {C.DIM}│{C.RESET}  {malla_txt}" + " " * 30 + C.DIM + "│" + C.RESET)
+    print(f"  {C.DIM}│{C.RESET}  "
+          f"{C.CYAN}↑{C.RESET}{r['msgs_enviados']} "
+          f"{C.CYAN}↓{C.RESET}{r['msgs_recibidos']} msgs  "
+          f"{C.CYAN}📁{C.RESET}{r['archivos_enviados']}  "
+          f"{C.CYAN}📡{C.RESET}{r['gossip_propagados']} gossip  "
+          f"{C.GRIS}⏳{r['uptime']}{C.RESET}"
+          + " " * 3 + C.DIM + "│" + C.RESET)
+    print(f"  {C.DIM}│  {C.GRIS}{ts:<49}{C.RESET}{C.DIM}│{C.RESET}")
+    print(C.DIM + "  └───────────────────────────────────────────────────┘" + C.RESET)
+
+
+# ============================================================
+# BASE DE DATOS SQLITE
+# ============================================================
+
+class BaseDatos:
+
+    def __init__(self, ruta):
+        self.ruta = str(ruta)
+        self.inicializar()
+
+    def conectar(self):
+        con = sqlite3.connect(self.ruta, timeout=10, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+        return con
+
+    def inicializar(self):
+        with LOCK:
+            con = self.conectar()
+            cur = con.cursor()
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS estado (
+                clave TEXT PRIMARY KEY,
+                valor TEXT NOT NULL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS nodos (
+                nombre      TEXT PRIMARY KEY,
+                host        TEXT NOT NULL,
+                puerto      INTEGER NOT NULL,
+                latitud     REAL,
+                longitud    REAL,
+                public_key  TEXT,
+                estado      TEXT,
+                ultimo_visto REAL,
+                creado      REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS rutas (
+                destino    TEXT PRIMARY KEY,
+                rtt        REAL DEFAULT 999999,
+                exitos     INTEGER DEFAULT 0,
+                fallos     INTEGER DEFAULT 0,
+                salud      TEXT,
+                actualizado REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS mensajes (
+                id         TEXT PRIMARY KEY,
+                origen     TEXT,
+                destino    TEXT,
+                contenido  TEXT,
+                timestamp  REAL,
+                direccion  TEXT
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS paquetes_vistos (
+                id    TEXT PRIMARY KEY,
+                visto REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS eventos (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                fecha   REAL,
+                tipo    TEXT,
+                detalle TEXT
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS peers_p2p (
+                node_id         TEXT PRIMARY KEY,
+                nombre          TEXT,
+                host            TEXT NOT NULL,
+                puerto          INTEGER NOT NULL,
+                public_key      TEXT,
+                x25519_pub      TEXT,
+                descubierto_via TEXT,
+                ultimo_visto    REAL,
+                rtt             REAL DEFAULT 999999,
+                creado          REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS gossip_stats (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                packet_id   TEXT,
+                tipo        TEXT,
+                saltos      INTEGER,
+                reenviado_a INTEGER,
+                timestamp   REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS canales (
+                nombre      TEXT PRIMARY KEY,
+                descripcion TEXT,
+                suscrito    INTEGER DEFAULT 1,
+                creado      REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS mensajes_canal (
+                id            TEXT PRIMARY KEY,
+                canal         TEXT NOT NULL,
+                origen        TEXT,
+                origen_nombre TEXT,
+                contenido     TEXT,
+                timestamp     REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS cola_mensajes (
+                id                  TEXT PRIMARY KEY,
+                destinatario_id     TEXT,
+                destinatario_host   TEXT,
+                destinatario_puerto INTEGER,
+                paquete_json        TEXT,
+                intentos            INTEGER DEFAULT 0,
+                creado              REAL,
+                expira              REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS transferencias (
+                id               TEXT PRIMARY KEY,
+                nombre_archivo   TEXT,
+                tamano           INTEGER,
+                total_chunks     INTEGER,
+                chunks_recibidos INTEGER DEFAULT 0,
+                origen           TEXT,
+                destino          TEXT,
+                estado           TEXT DEFAULT 'PENDIENTE',
+                creado           REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                id                TEXT PRIMARY KEY,
+                transferencia_id  TEXT,
+                indice            INTEGER,
+                datos_b64         TEXT,
+                timestamp         REAL,
+                UNIQUE(transferencia_id, indice)
+            )""")
+
+            # ── Bluetooth (transporte alterno sin WiFi/LAN) ───
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS peers_bt (
+                mac          TEXT PRIMARY KEY,
+                nombre       TEXT,
+                canal        INTEGER,
+                node_id      TEXT,
+                ultimo_visto REAL,
+                rtt          REAL DEFAULT 999999,
+                creado       REAL
+            )""")
+
+            # ── Posiciones GPS (compartidas por gossip, sin internet) ──
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS posiciones (
+                node_id     TEXT PRIMARY KEY,
+                nombre      TEXT,
+                latitud     REAL,
+                longitud    REAL,
+                actualizado REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS sos_alertas (
+                sos_id      TEXT PRIMARY KEY,
+                node_id     TEXT,
+                nombre      TEXT,
+                mensaje     TEXT,
+                latitud     REAL,
+                longitud    REAL,
+                creado      REAL,
+                resuelto    INTEGER DEFAULT 0,
+                resuelto_ts REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS mensajes_anclados (
+                ancla_id          TEXT PRIMARY KEY,
+                autor_node_id     TEXT,
+                autor_nombre      TEXT,
+                contenido_cifrado TEXT,
+                firma             TEXT,
+                latitud           REAL,
+                longitud          REAL,
+                radio_m           REAL,
+                creado            REAL,
+                expira            REAL,
+                activo            INTEGER DEFAULT 1,
+                entregada         INTEGER DEFAULT 0,
+                entregada_ts      REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS medios (
+                media_id      TEXT PRIMARY KEY,
+                origen_node_id TEXT,
+                nombre        TEXT,
+                mime          TEXT,
+                tamano_original INTEGER,
+                datos_comprimidos BLOB,
+                creado        REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS testigos (
+                id_testigo    TEXT PRIMARY KEY,
+                nodo_a        TEXT,
+                nodo_b        TEXT,
+                nombre_a      TEXT,
+                nombre_b      TEXT,
+                tiempo_utc    TEXT,
+                lat_a         REAL,
+                lon_a         REAL,
+                precision_a   REAL,
+                lat_b         REAL,
+                lon_b         REAL,
+                precision_b   REAL,
+                distancia_km  REAL,
+                adjunto_tipo  TEXT,
+                adjunto_id    TEXT,
+                firma_a       TEXT,
+                firma_b       TEXT,
+                creado        REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS juego_partidas (
+                partida_id      TEXT PRIMARY KEY,
+                nombre          TEXT,
+                creador_node_id TEXT,
+                creador_nombre  TEXT,
+                estado          TEXT DEFAULT 'esperando',
+                max_despistes   INTEGER,
+                canal           TEXT,
+                creado          REAL,
+                terminada_ts    REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS juego_jugadores (
+                partida_id      TEXT,
+                node_id         TEXT,
+                nombre          TEXT,
+                rol             TEXT,
+                despistes_usados INTEGER DEFAULT 0,
+                despiste_activo INTEGER DEFAULT 0,
+                ultimo_visto    REAL,
+                PRIMARY KEY (partida_id, node_id)
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS juego_resultados (
+                partida_id           TEXT PRIMARY KEY,
+                nombre_partida       TEXT,
+                escondido            TEXT,
+                escondido_nombre     TEXT,
+                encontrado_por       TEXT,
+                encontrado_por_nombre TEXT,
+                tiempo_utc           TEXT,
+                lat                  REAL,
+                lon                  REAL,
+                despistes_usados     INTEGER,
+                firma                TEXT,
+                creado               REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS vinculacion_codigos (
+                codigo      TEXT PRIMARY KEY,
+                node_id_a   TEXT,
+                creado      REAL,
+                expira      REAL,
+                usado       INTEGER DEFAULT 0
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS vinculaciones (
+                id_vinculo    TEXT PRIMARY KEY,
+                codigo        TEXT,
+                nodo_a        TEXT,
+                nodo_b        TEXT,
+                nombre_a      TEXT,
+                nombre_b      TEXT,
+                duracion      TEXT,
+                tiempo_utc    TEXT,
+                expira_sesion REAL,
+                firma_a       TEXT,
+                firma_b       TEXT,
+                revocada      INTEGER DEFAULT 0,
+                creado        REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS asistente_memoria (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                pregunta    TEXT,
+                respuesta   TEXT,
+                categoria   TEXT,
+                fecha       REAL
+            )""")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS reputacion (
+                node_id             TEXT PRIMARY KEY,
+                nombre              TEXT,
+                score               INTEGER DEFAULT 500,
+                pings_ok            INTEGER DEFAULT 0,
+                pings_fail          INTEGER DEFAULT 0,
+                msgs_entregados     INTEGER DEFAULT 0,
+                msgs_fallidos       INTEGER DEFAULT 0,
+                gossip_relays       INTEGER DEFAULT 0,
+                actualizado         REAL
+            )""")
+
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_nodos_estado        ON nodos(estado)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_rutas_salud         ON rutas(salud)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_mensajes_timestamp  ON mensajes(timestamp)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_eventos_fecha       ON eventos(fecha)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_peers_p2p_visto    ON peers_p2p(ultimo_visto)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_msgs_canal          ON mensajes_canal(canal)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_cola_expira         ON cola_mensajes(expira)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_chunks_transferencia ON chunks(transferencia_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_peers_bt_visto ON peers_bt(ultimo_visto)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_posiciones_actualizado ON posiciones(actualizado)")
+
+            # ── Migraciones aditivas (compatibles con bases de datos ya
+            #    existentes de versiones anteriores de RET) ──
+            for alter_sql in [
+                "ALTER TABLE peers_p2p ADD COLUMN modo TEXT DEFAULT 'completo'",
+            ]:
+                try:
+                    cur.execute(alter_sql)
+                except sqlite3.OperationalError:
+                    pass  # la columna ya existe — nada que hacer
+
+            con.commit()
+            con.close()
+
+    def set_estado(self, clave, valor):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO estado(clave, valor) VALUES (?, ?)
+            ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor
+            """, (clave, json.dumps(valor, ensure_ascii=False)))
+            con.commit()
+            con.close()
+
+    def get_estado(self, clave, defecto=None):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute("SELECT valor FROM estado WHERE clave=?", (clave,)).fetchone()
+            con.close()
+            if fila is None:
+                return defecto
+            try:
+                return json.loads(fila["valor"])
+            except Exception:
+                return defecto
+
+    def evento(self, tipo, detalle):
+        with LOCK:
+            con = self.conectar()
+            con.execute(
+                "INSERT INTO eventos(fecha,tipo,detalle) VALUES(?,?,?)",
+                (ahora_epoch(), tipo, detalle)
+            )
+            con.commit()
+            con.close()
+
+    def listar_eventos(self, limite=50):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM eventos ORDER BY fecha DESC LIMIT ?", (limite,)
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def guardar_nodo(self, nombre, host, puerto, latitud=None, longitud=None,
+                     public_key=None, estado="DESCONOCIDO"):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO nodos(nombre,host,puerto,latitud,longitud,
+                              public_key,estado,ultimo_visto,creado)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(nombre) DO UPDATE SET
+                host=excluded.host,
+                puerto=excluded.puerto,
+                latitud=COALESCE(excluded.latitud, nodos.latitud),
+                longitud=COALESCE(excluded.longitud, nodos.longitud),
+                public_key=COALESCE(excluded.public_key, nodos.public_key),
+                estado=excluded.estado,
+                ultimo_visto=excluded.ultimo_visto
+            """, (nombre, host, puerto, latitud, longitud,
+                  public_key, estado, ahora_epoch(), ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def actualizar_nodo_estado(self, nombre, estado):
+        with LOCK:
+            con = self.conectar()
+            con.execute(
+                "UPDATE nodos SET estado=?, ultimo_visto=? WHERE nombre=?",
+                (estado, ahora_epoch(), nombre)
+            )
+            con.commit()
+            con.close()
+
+    def listar_nodos(self):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute("SELECT * FROM nodos ORDER BY nombre").fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def obtener_nodo(self, nombre):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute("SELECT * FROM nodos WHERE nombre=?", (nombre,)).fetchone()
+            con.close()
+            return dict(fila) if fila else None
+
+    def eliminar_nodo(self, nombre):
+        with LOCK:
+            con = self.conectar()
+            cur = con.execute("DELETE FROM nodos WHERE nombre=?", (nombre,))
+            con.commit()
+            eliminado = cur.rowcount > 0
+            con.close()
+            return eliminado
+
+    def actualizar_ruta(self, destino, rtt=None, exito=True):
+        with LOCK:
+            con = self.conectar()
+            anterior = con.execute(
+                "SELECT * FROM rutas WHERE destino=?", (destino,)
+            ).fetchone()
+
+            if anterior is None:
+                exitos   = 1 if exito else 0
+                fallos   = 0 if exito else 1
+                rtt_final = rtt if rtt is not None else 999999.0
+            else:
+                exitos      = anterior["exitos"]
+                fallos      = anterior["fallos"]
+                rtt_anterior = anterior["rtt"]
+                if exito:
+                    exitos += 1
+                    if rtt is not None:
+                        rtt_final = rtt if rtt_anterior >= 999999 \
+                                    else 0.7 * rtt_anterior + 0.3 * rtt
+                    else:
+                        rtt_final = rtt_anterior
+                else:
+                    fallos   += 1
+                    rtt_final = rtt_anterior
+
+            if   fallos >= 5 and fallos > exitos:    salud = "CAIDO"
+            elif exito and rtt_final < 50:            salud = "OPTIMO"
+            elif exito and rtt_final < 150:           salud = "MEDIO"
+            elif exito:                               salud = "LENTO"
+            else:                                     salud = "INACCESIBLE"
+
+            con.execute("""
+            INSERT INTO rutas(destino,rtt,exitos,fallos,salud,actualizado)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(destino) DO UPDATE SET
+                rtt=excluded.rtt, exitos=excluded.exitos,
+                fallos=excluded.fallos, salud=excluded.salud,
+                actualizado=excluded.actualizado
+            """, (destino, round(rtt_final, 3), exitos, fallos, salud, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def listar_rutas(self):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute("SELECT * FROM rutas ORDER BY rtt ASC").fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def guardar_mensaje(self, mensaje_id, origen, destino, contenido, direccion):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO mensajes(id,origen,destino,contenido,timestamp,direccion)
+            VALUES (?,?,?,?,?,?)
+            """, (mensaje_id, origen, destino, contenido, ahora_epoch(), direccion))
+            con.commit()
+            con.close()
+
+    def listar_mensajes(self, limite=50):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM mensajes ORDER BY timestamp DESC LIMIT ?", (limite,)
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def paquete_visto(self, paquete_id):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute(
+                "SELECT id FROM paquetes_vistos WHERE id=?", (paquete_id,)
+            ).fetchone()
+            con.close()
+            return fila is not None
+
+    def marcar_paquete_visto(self, paquete_id):
+        with LOCK:
+            con = self.conectar()
+            con.execute(
+                "INSERT OR IGNORE INTO paquetes_vistos(id,visto) VALUES(?,?)",
+                (paquete_id, ahora_epoch())
+            )
+            con.execute(
+                "DELETE FROM paquetes_vistos WHERE visto < ?",
+                (ahora_epoch() - 86400,)
+            )
+            con.commit()
+            con.close()
+
+    def guardar_peer_p2p(self, node_id, nombre, host, puerto,
+                          public_key=None, via="DESCONOCIDO", rtt=999999,
+                          modo="completo"):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO peers_p2p(node_id,nombre,host,puerto,public_key,
+                                  descubierto_via,ultimo_visto,rtt,creado,modo)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                nombre=excluded.nombre,
+                host=excluded.host,
+                puerto=excluded.puerto,
+                public_key=COALESCE(excluded.public_key, peers_p2p.public_key),
+                descubierto_via=excluded.descubierto_via,
+                ultimo_visto=excluded.ultimo_visto,
+                modo=excluded.modo,
+                rtt=CASE WHEN excluded.rtt < 999999 THEN excluded.rtt
+                         ELSE peers_p2p.rtt END
+            """, (node_id, nombre, host, puerto, public_key,
+                  via, ahora_epoch(), rtt, ahora_epoch(), modo))
+            con.commit()
+            con.close()
+
+    def listar_peers_p2p(self, solo_recientes=False):
+        with LOCK:
+            con = self.conectar()
+            if solo_recientes:
+                umbral = ahora_epoch() - 7200
+                filas = con.execute(
+                    "SELECT * FROM peers_p2p WHERE ultimo_visto>? ORDER BY rtt ASC",
+                    (umbral,)
+                ).fetchall()
+            else:
+                filas = con.execute(
+                    "SELECT * FROM peers_p2p ORDER BY ultimo_visto DESC"
+                ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def obtener_peer_p2p(self, node_id):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute(
+                "SELECT * FROM peers_p2p WHERE node_id=?", (node_id,)
+            ).fetchone()
+            con.close()
+            return dict(fila) if fila else None
+
+    def contar_peers_p2p(self):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute("SELECT COUNT(*) as total FROM peers_p2p").fetchone()
+            con.close()
+            return fila["total"] if fila else 0
+
+    # ---- NUEVO: peers descubiertos por Bluetooth ----
+
+    def guardar_peer_bt(self, mac, nombre, canal, node_id=None, rtt=999999):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO peers_bt(mac,nombre,canal,node_id,ultimo_visto,rtt,creado)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(mac) DO UPDATE SET
+                nombre=excluded.nombre,
+                canal=excluded.canal,
+                node_id=COALESCE(excluded.node_id, peers_bt.node_id),
+                ultimo_visto=excluded.ultimo_visto,
+                rtt=CASE WHEN excluded.rtt < 999999 THEN excluded.rtt
+                         ELSE peers_bt.rtt END
+            """, (mac, nombre, canal, node_id, ahora_epoch(), rtt, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def listar_peers_bt(self):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM peers_bt ORDER BY ultimo_visto DESC"
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def contar_peers_bt(self):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute("SELECT COUNT(*) as total FROM peers_bt").fetchone()
+            con.close()
+            return fila["total"] if fila else 0
+
+    # ---- NUEVO: posiciones GPS (compartidas por gossip) ----
+
+    def actualizar_posicion(self, node_id, nombre, lat, lon):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO posiciones(node_id,nombre,latitud,longitud,actualizado)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                nombre=excluded.nombre,
+                latitud=excluded.latitud,
+                longitud=excluded.longitud,
+                actualizado=excluded.actualizado
+            """, (node_id, nombre, lat, lon, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def listar_posiciones(self, max_edad_s=None):
+        with LOCK:
+            con = self.conectar()
+            if max_edad_s:
+                umbral = ahora_epoch() - max_edad_s
+                filas = con.execute(
+                    "SELECT * FROM posiciones WHERE actualizado>? ORDER BY actualizado DESC",
+                    (umbral,)
+                ).fetchall()
+            else:
+                filas = con.execute(
+                    "SELECT * FROM posiciones ORDER BY actualizado DESC"
+                ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def registrar_sos(self, sos_id, node_id, nombre, mensaje, lat, lon):
+        """
+        Guarda una alerta SOS entrante (propia o de otro nodo). INSERT OR
+        IGNORE porque el mismo sos_id puede llegar varias veces por gossip
+        epidémico (varios caminos de la malla) — solo cuenta la primera.
+        """
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO sos_alertas
+                (sos_id,node_id,nombre,mensaje,latitud,longitud,creado,resuelto)
+            VALUES (?,?,?,?,?,?,?,0)
+            """, (sos_id, node_id, nombre, mensaje, lat, lon, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def listar_sos(self, max_edad_s=6*3600, solo_activas=True):
+        with LOCK:
+            con = self.conectar()
+            umbral = ahora_epoch() - max_edad_s
+            if solo_activas:
+                filas = con.execute(
+                    "SELECT * FROM sos_alertas WHERE creado>? AND resuelto=0 ORDER BY creado DESC",
+                    (umbral,)
+                ).fetchall()
+            else:
+                filas = con.execute(
+                    "SELECT * FROM sos_alertas WHERE creado>? ORDER BY creado DESC",
+                    (umbral,)
+                ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def resolver_sos(self, sos_id):
+        with LOCK:
+            con = self.conectar()
+            con.execute(
+                "UPDATE sos_alertas SET resuelto=1, resuelto_ts=? WHERE sos_id=?",
+                (ahora_epoch(), sos_id)
+            )
+            con.commit()
+            afectadas = con.total_changes
+            con.close()
+            return afectadas > 0
+
+    # ---- Mensajes anclados geolocalizados ("dejados atrás") ----
+
+    def guardar_ancla(self, ancla_id, autor_node_id, autor_nombre, contenido_cifrado,
+                       firma, lat, lon, radio_m, creado, expira):
+        """INSERT OR IGNORE: el mismo ancla_id puede llegar varias veces
+        por gossip epidémico (varios caminos de la malla) — solo cuenta
+        la primera vez que la vemos."""
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO mensajes_anclados
+                (ancla_id,autor_node_id,autor_nombre,contenido_cifrado,firma,
+                 latitud,longitud,radio_m,creado,expira,activo)
+            VALUES (?,?,?,?,?,?,?,?,?,?,1)
+            """, (ancla_id, autor_node_id, autor_nombre, contenido_cifrado, firma,
+                  lat, lon, radio_m, creado, expira))
+            con.commit()
+            con.close()
+
+    def listar_anclas_activas(self, ahora=None):
+        ahora = ahora if ahora is not None else ahora_epoch()
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute("""
+            SELECT * FROM mensajes_anclados
+            WHERE activo=1 AND (expira IS NULL OR expira > ?)
+            ORDER BY creado DESC
+            """, (ahora,)).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def listar_anclas_propias(self, autor_node_id):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute("""
+            SELECT * FROM mensajes_anclados WHERE autor_node_id=? AND activo=1
+            ORDER BY creado DESC
+            """, (autor_node_id,)).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def listar_anclas_recibidas(self, mi_node_id):
+        """Anclas de OTROS que ya se entregaron aquí (mi posición cayó
+        dentro del radio). El contenido se descifra al servirlo, no se
+        guarda descifrado en disco."""
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute("""
+            SELECT * FROM mensajes_anclados
+            WHERE entregada=1 AND autor_node_id!=?
+            ORDER BY entregada_ts DESC
+            """, (mi_node_id,)).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def desactivar_ancla(self, ancla_id):
+        with LOCK:
+            con = self.conectar()
+            con.execute("UPDATE mensajes_anclados SET activo=0 WHERE ancla_id=?", (ancla_id,))
+            con.commit()
+            con.close()
+
+    def marcar_ancla_entregada(self, ancla_id):
+        with LOCK:
+            con = self.conectar()
+            con.execute(
+                "UPDATE mensajes_anclados SET entregada=1, entregada_ts=? WHERE ancla_id=?",
+                (ahora_epoch(), ancla_id)
+            )
+            con.commit()
+            con.close()
+
+    def purgar_anclas_vencidas(self, ahora=None):
+        """Borrado real, no solo 'ocultar' — así 'se elimina limpio solo'
+        de verdad, no queda basura acumulándose en la base de datos."""
+        ahora = ahora if ahora is not None else ahora_epoch()
+        with LOCK:
+            con = self.conectar()
+            cur = con.execute(
+                "DELETE FROM mensajes_anclados WHERE expira IS NOT NULL AND expira<=?",
+                (ahora,)
+            )
+            borradas = cur.rowcount
+            con.commit()
+            con.close()
+            return borradas
+
+    def obtener_ancla(self, ancla_id):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute(
+                "SELECT * FROM mensajes_anclados WHERE ancla_id=?", (ancla_id,)
+            ).fetchone()
+            con.close()
+            return dict(fila) if fila else None
+
+    # ---- Fotos y videos compartidos en el chat ----
+
+    def guardar_medio(self, media_id, origen_node_id, nombre, mime,
+                       tamano_original, datos_comprimidos):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO medios
+                (media_id,origen_node_id,nombre,mime,tamano_original,datos_comprimidos,creado)
+            VALUES (?,?,?,?,?,?,?)
+            """, (media_id, origen_node_id, nombre, mime, tamano_original,
+                  datos_comprimidos, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def obtener_medio(self, media_id):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute(
+                "SELECT * FROM medios WHERE media_id=?", (media_id,)
+            ).fetchone()
+            con.close()
+            return dict(fila) if fila else None
+
+    # ---- Nodo testigo: prueba de contacto firmada ----
+
+    def guardar_testigo(self, registro):
+        """INSERT OR IGNORE: el mismo id_testigo puede llegar por varios
+        caminos de la malla (gossip epidémico) o de ambos lados del
+        propio contacto — solo cuenta la primera vez."""
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO testigos
+                (id_testigo,nodo_a,nodo_b,nombre_a,nombre_b,tiempo_utc,
+                 lat_a,lon_a,precision_a,lat_b,lon_b,precision_b,
+                 distancia_km,adjunto_tipo,adjunto_id,firma_a,firma_b,creado)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                registro["id_testigo"], registro["nodo_a"], registro["nodo_b"],
+                registro.get("nombre_a", "?"), registro.get("nombre_b", "?"),
+                registro["tiempo_utc"],
+                registro["ubicacion_a"]["lat"], registro["ubicacion_a"]["lon"],
+                registro["ubicacion_a"].get("precision"),
+                registro["ubicacion_b"]["lat"], registro["ubicacion_b"]["lon"],
+                registro["ubicacion_b"].get("precision"),
+                registro["distancia_km"], registro["adjunto_tipo"], registro.get("adjunto_id"),
+                registro["firma_a"], registro["firma_b"], ahora_epoch()
+            ))
+            con.commit()
+            con.close()
+
+    def listar_testigos(self, mi_clave_publica=None):
+        with LOCK:
+            con = self.conectar()
+            if mi_clave_publica:
+                filas = con.execute("""
+                SELECT * FROM testigos WHERE nodo_a=? OR nodo_b=?
+                ORDER BY creado DESC
+                """, (mi_clave_publica, mi_clave_publica)).fetchall()
+            else:
+                filas = con.execute(
+                    "SELECT * FROM testigos ORDER BY creado DESC"
+                ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def existe_testigo_reciente(self, clave_a, clave_b, desde_epoch):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute("""
+            SELECT 1 FROM testigos
+            WHERE creado>? AND ((nodo_a=? AND nodo_b=?) OR (nodo_a=? AND nodo_b=?))
+            LIMIT 1
+            """, (desde_epoch, clave_a, clave_b, clave_b, clave_a)).fetchone()
+            con.close()
+            return fila is not None
+
+    # ---- Juego Encuentro ----
+
+    def crear_partida_juego(self, partida_id, nombre, creador_node_id, creador_nombre,
+                             max_despistes, canal):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO juego_partidas
+                (partida_id,nombre,creador_node_id,creador_nombre,estado,max_despistes,canal,creado)
+            VALUES (?,?,?,?,'esperando',?,?,?)
+            """, (partida_id, nombre, creador_node_id, creador_nombre, max_despistes, canal, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def obtener_partida_juego(self, partida_id):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute(
+                "SELECT * FROM juego_partidas WHERE partida_id=?", (partida_id,)
+            ).fetchone()
+            con.close()
+            return dict(fila) if fila else None
+
+    def listar_partidas_juego(self, solo_activas=True):
+        with LOCK:
+            con = self.conectar()
+            if solo_activas:
+                filas = con.execute(
+                    "SELECT * FROM juego_partidas WHERE estado!='terminada' ORDER BY creado DESC"
+                ).fetchall()
+            else:
+                filas = con.execute(
+                    "SELECT * FROM juego_partidas ORDER BY creado DESC"
+                ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def marcar_partida_estado(self, partida_id, estado):
+        with LOCK:
+            con = self.conectar()
+            con.execute(
+                "UPDATE juego_partidas SET estado=?, terminada_ts=? WHERE partida_id=?",
+                (estado, ahora_epoch() if estado == "terminada" else None, partida_id)
+            )
+            con.commit()
+            con.close()
+
+    def upsert_jugador_juego(self, partida_id, node_id, nombre, rol):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO juego_jugadores (partida_id,node_id,nombre,rol,ultimo_visto)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(partida_id,node_id) DO UPDATE SET
+                nombre=excluded.nombre, rol=excluded.rol, ultimo_visto=excluded.ultimo_visto
+            """, (partida_id, node_id, nombre, rol, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def quitar_jugador_juego(self, partida_id, node_id):
+        with LOCK:
+            con = self.conectar()
+            con.execute(
+                "DELETE FROM juego_jugadores WHERE partida_id=? AND node_id=?",
+                (partida_id, node_id)
+            )
+            con.commit()
+            con.close()
+
+    def listar_jugadores_juego(self, partida_id, umbral_epoch=None):
+        with LOCK:
+            con = self.conectar()
+            if umbral_epoch:
+                filas = con.execute(
+                    "SELECT * FROM juego_jugadores WHERE partida_id=? AND ultimo_visto>?",
+                    (partida_id, umbral_epoch)
+                ).fetchall()
+            else:
+                filas = con.execute(
+                    "SELECT * FROM juego_jugadores WHERE partida_id=?", (partida_id,)
+                ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def incrementar_despiste_juego(self, partida_id, node_id, activo):
+        with LOCK:
+            con = self.conectar()
+            if activo:
+                con.execute("""
+                UPDATE juego_jugadores SET despistes_usados=despistes_usados+1, despiste_activo=1
+                WHERE partida_id=? AND node_id=?
+                """, (partida_id, node_id))
+            else:
+                con.execute("""
+                UPDATE juego_jugadores SET despiste_activo=0
+                WHERE partida_id=? AND node_id=?
+                """, (partida_id, node_id))
+            con.commit()
+            con.close()
+
+    def guardar_resultado_juego(self, registro):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO juego_resultados
+                (partida_id,nombre_partida,escondido,escondido_nombre,
+                 encontrado_por,encontrado_por_nombre,tiempo_utc,lat,lon,
+                 despistes_usados,firma,creado)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                registro["partida_id"], registro["nombre_partida"],
+                registro["escondido"], registro["escondido_nombre"],
+                registro["encontrado_por"], registro["encontrado_por_nombre"],
+                registro["tiempo_utc"], registro["lat"], registro["lon"],
+                registro["despistes_usados"], registro["firma"], ahora_epoch()
+            ))
+            con.commit()
+            con.close()
+
+    def listar_resultados_juego(self, limite=30):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM juego_resultados ORDER BY creado DESC LIMIT ?", (limite,)
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    # ---- Vinculación segura (código + confirmación Ed25519) ----
+
+    def crear_codigo_vinculacion(self, codigo, node_id_a, expira):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO vinculacion_codigos (codigo,node_id_a,creado,expira,usado)
+            VALUES (?,?,?,?,0)
+            """, (codigo, node_id_a, ahora_epoch(), expira))
+            con.commit()
+            con.close()
+
+    def obtener_codigo_vinculacion(self, codigo):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute(
+                "SELECT * FROM vinculacion_codigos WHERE codigo=?", (codigo,)
+            ).fetchone()
+            con.close()
+            return dict(fila) if fila else None
+
+    def marcar_codigo_vinculacion_usado(self, codigo):
+        with LOCK:
+            con = self.conectar()
+            con.execute("UPDATE vinculacion_codigos SET usado=1 WHERE codigo=?", (codigo,))
+            con.commit()
+            con.close()
+
+    def limpiar_codigos_vinculacion_vencidos(self):
+        with LOCK:
+            con = self.conectar()
+            cur = con.execute(
+                "DELETE FROM vinculacion_codigos WHERE expira<=?", (ahora_epoch(),)
+            )
+            borrados = cur.rowcount
+            con.commit()
+            con.close()
+            return borrados
+
+    def guardar_vinculacion(self, registro):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO vinculaciones
+                (id_vinculo,codigo,nodo_a,nodo_b,nombre_a,nombre_b,duracion,
+                 tiempo_utc,expira_sesion,firma_a,firma_b,revocada,creado)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?)
+            """, (
+                registro["id_vinculo"], registro["codigo"], registro["nodo_a"], registro["nodo_b"],
+                registro.get("nombre_a", "?"), registro.get("nombre_b", "?"), registro["duracion"],
+                registro["tiempo_utc"], registro["expira_sesion"],
+                registro["firma_a"], registro["firma_b"], ahora_epoch()
+            ))
+            con.commit()
+            con.close()
+
+    def listar_vinculaciones(self, mi_clave_publica=None):
+        with LOCK:
+            con = self.conectar()
+            if mi_clave_publica:
+                filas = con.execute("""
+                SELECT * FROM vinculaciones WHERE (nodo_a=? OR nodo_b=?) AND revocada=0
+                ORDER BY creado DESC
+                """, (mi_clave_publica, mi_clave_publica)).fetchall()
+            else:
+                filas = con.execute(
+                    "SELECT * FROM vinculaciones WHERE revocada=0 ORDER BY creado DESC"
+                ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def revocar_vinculacion(self, id_vinculo):
+        with LOCK:
+            con = self.conectar()
+            con.execute("UPDATE vinculaciones SET revocada=1 WHERE id_vinculo=?", (id_vinculo,))
+            con.commit()
+            con.close()
+
+    # ---- Memoria del asistente local ----
+
+    def guardar_pregunta_asistente(self, pregunta, respuesta, categoria):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO asistente_memoria (pregunta,respuesta,categoria,fecha)
+            VALUES (?,?,?,?)
+            """, (pregunta, respuesta, categoria, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def listar_memoria_asistente(self, limite=200):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM asistente_memoria ORDER BY fecha DESC LIMIT ?", (limite,)
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def contar_preguntas_asistente(self):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute("SELECT COUNT(*) AS n FROM asistente_memoria").fetchone()
+            con.close()
+            return fila["n"] if fila else 0
+
+    def registrar_gossip_stat(self, packet_id, tipo, saltos, reenviado_a):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO gossip_stats(packet_id,tipo,saltos,reenviado_a,timestamp)
+            VALUES (?,?,?,?,?)
+            """, (packet_id, tipo, saltos, reenviado_a, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def listar_gossip_stats(self, limite=20):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM gossip_stats ORDER BY timestamp DESC LIMIT ?", (limite,)
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def suscribir_canal(self, nombre, descripcion=""):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO canales(nombre,descripcion,suscrito,creado)
+            VALUES(?,?,1,?)
+            ON CONFLICT(nombre) DO UPDATE SET suscrito=1
+            """, (nombre, descripcion, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def desuscribir_canal(self, nombre):
+        with LOCK:
+            con = self.conectar()
+            con.execute("UPDATE canales SET suscrito=0 WHERE nombre=?", (nombre,))
+            con.commit()
+            con.close()
+
+    def listar_canales(self):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM canales ORDER BY nombre"
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def esta_suscrito(self, canal):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute(
+                "SELECT suscrito FROM canales WHERE nombre=?", (canal,)
+            ).fetchone()
+            con.close()
+            return bool(fila and fila["suscrito"])
+
+    def guardar_mensaje_canal(self, msg_id, canal, origen, origen_nombre, contenido):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO mensajes_canal
+            (id,canal,origen,origen_nombre,contenido,timestamp)
+            VALUES(?,?,?,?,?,?)
+            """, (msg_id, canal, origen, origen_nombre, contenido, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def listar_mensajes_canal(self, canal, limite=50):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute("""
+            SELECT * FROM mensajes_canal
+            WHERE canal=? ORDER BY timestamp DESC LIMIT ?
+            """, (canal, limite)).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def listar_mensajes_canal_desde(self, canal, desde_ts, limite=50):
+        """Para notificaciones: solo lo nuevo desde la última revisión."""
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute("""
+            SELECT * FROM mensajes_canal
+            WHERE canal=? AND timestamp>? ORDER BY timestamp ASC LIMIT ?
+            """, (canal, desde_ts, limite)).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def encolar_mensaje(self, msg_id, dest_id, dest_host, dest_puerto, paquete_dict):
+        with LOCK:
+            con = self.conectar()
+            expira = ahora_epoch() + STORE_FORWARD_TTL * 3600
+            con.execute("""
+            INSERT OR IGNORE INTO cola_mensajes
+            (id,destinatario_id,destinatario_host,destinatario_puerto,
+             paquete_json,intentos,creado,expira)
+            VALUES(?,?,?,?,?,0,?,?)
+            """, (msg_id, dest_id, dest_host, dest_puerto,
+                  json.dumps(paquete_dict), ahora_epoch(), expira))
+            con.commit()
+            con.close()
+
+    def mensajes_pendientes_para(self, dest_id):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute("""
+            SELECT * FROM cola_mensajes
+            WHERE destinatario_id=? AND expira>? AND intentos<10
+            ORDER BY creado ASC
+            """, (dest_id, ahora_epoch())).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def marcar_entregado(self, msg_id):
+        with LOCK:
+            con = self.conectar()
+            con.execute("DELETE FROM cola_mensajes WHERE id=?", (msg_id,))
+            con.commit()
+            con.close()
+
+    def incrementar_intento(self, msg_id):
+        with LOCK:
+            con = self.conectar()
+            con.execute(
+                "UPDATE cola_mensajes SET intentos=intentos+1 WHERE id=?", (msg_id,)
+            )
+            con.commit()
+            con.close()
+
+    def limpiar_cola_expirada(self):
+        with LOCK:
+            con = self.conectar()
+            con.execute(
+                "DELETE FROM cola_mensajes WHERE expira<?", (ahora_epoch(),)
+            )
+            con.commit()
+            con.close()
+
+    def iniciar_transferencia(self, tr_id, nombre, tamano, total_chunks,
+                               origen, destino, estado="ENVIANDO"):
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT OR IGNORE INTO transferencias
+            (id,nombre_archivo,tamano,total_chunks,chunks_recibidos,
+             origen,destino,estado,creado)
+            VALUES(?,?,?,?,0,?,?,?,?)
+            """, (tr_id, nombre, tamano, total_chunks, origen, destino,
+                  estado, ahora_epoch()))
+            con.commit()
+            con.close()
+
+    def guardar_chunk(self, tr_id, indice, datos_b64):
+        with LOCK:
+            con = self.conectar()
+            chunk_id = f"{tr_id}-{indice}"
+            con.execute("""
+            INSERT OR IGNORE INTO chunks(id,transferencia_id,indice,datos_b64,timestamp)
+            VALUES(?,?,?,?,?)
+            """, (chunk_id, tr_id, indice, datos_b64, ahora_epoch()))
+            con.execute("""
+            UPDATE transferencias
+            SET chunks_recibidos=chunks_recibidos+1
+            WHERE id=? AND chunks_recibidos < total_chunks
+            """, (tr_id,))
+            con.execute("""
+            UPDATE transferencias SET estado='COMPLETO'
+            WHERE id=? AND chunks_recibidos>=total_chunks
+            """, (tr_id,))
+            con.commit()
+            con.close()
+
+    def listar_transferencias(self):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM transferencias ORDER BY creado DESC"
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def chunks_de(self, tr_id):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM chunks WHERE transferencia_id=? ORDER BY indice",
+                (tr_id,)
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def actualizar_reputacion(self, node_id, nombre="", evento="ping_ok"):
+        deltas = {
+            "ping_ok":           (+10, "pings_ok"),
+            "ping_fail":         (-20, "pings_fail"),
+            "msg_entregado":     (+20, "msgs_entregados"),
+            "msg_fallido":       (-30, "msgs_fallidos"),
+            "gossip_relay":      ( +5, "gossip_relays"),
+        }
+        delta_score, campo = deltas.get(evento, (0, "pings_ok"))
+        with LOCK:
+            con = self.conectar()
+            con.execute("""
+            INSERT INTO reputacion(node_id,nombre,score,actualizado)
+            VALUES(?,?,?,?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                nombre=excluded.nombre,
+                score=MAX(0, MIN(1000, score + ?)),
+                actualizado=excluded.actualizado
+            """, (node_id, nombre, REP_INICIAL, ahora_epoch(), delta_score))
+            if campo:
+                con.execute(
+                    f"UPDATE reputacion SET {campo}={campo}+1 WHERE node_id=?",
+                    (node_id,)
+                )
+            con.commit()
+            con.close()
+
+    def listar_reputacion(self):
+        with LOCK:
+            con = self.conectar()
+            filas = con.execute(
+                "SELECT * FROM reputacion ORDER BY score DESC"
+            ).fetchall()
+            con.close()
+            return [dict(f) for f in filas]
+
+    def score_de(self, node_id):
+        with LOCK:
+            con = self.conectar()
+            fila = con.execute(
+                "SELECT score FROM reputacion WHERE node_id=?", (node_id,)
+            ).fetchone()
+            con.close()
+            return fila["score"] if fila else REP_INICIAL
+
+
+# ============================================================
+# IDENTIDAD CRIPTOGRÁFICA PERSISTENTE  (original intacto)
+# ============================================================
+
+class IdentidadNodo:
+
+    def __init__(self):
+        self.private_key    = None   # Ed25519 — firma
+        self.public_key     = None
+        self.node_id        = None
+        self.x25519_priv    = None   # X25519  — cifrado E2E
+        self.x25519_pub     = None
+        self.cargar_o_crear()
+
+    def cargar_o_crear(self):
+        if IDENTIDAD_PATH.exists():
+            try:
+                with open(IDENTIDAD_PATH, "r", encoding="utf-8") as f:
+                    datos = json.load(f)
+                privada = base64.b64decode(datos["private_key"])
+                self.private_key = Ed25519PrivateKey.from_private_bytes(privada)
+                self.public_key  = self.private_key.public_key()
+                self.node_id     = datos["node_id"]
+                self._generar_x25519()
+                return
+            except Exception as error:
+                print("Error cargando identidad:", error)
+
+        self.private_key = Ed25519PrivateKey.generate()
+        self.public_key  = self.private_key.public_key()
+
+        publica  = self.public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self.node_id = "RET-" + hashlib.sha256(publica).hexdigest()[:16].upper()
+
+        privada = self.private_key.private_bytes(
+            Encoding.Raw, PrivateFormat.Raw, NoEncryption()
+        )
+        datos = {
+            "node_id":     self.node_id,
+            "private_key": base64.b64encode(privada).decode("ascii"),
+            "public_key":  base64.b64encode(publica).decode("ascii"),
+        }
+        with open(IDENTIDAD_PATH, "w", encoding="utf-8") as f:
+            json.dump(datos, f, indent=2)
+
+        self._generar_x25519()
+
+    def _generar_x25519(self):
+        """Genera o carga el par de claves X25519 para cifrado E2E."""
+        x_path = IDENTIDAD_PATH.parent / "x25519.json"
+        if x_path.exists():
+            try:
+                with open(x_path, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                raw = base64.b64decode(d["private"])
+                self.x25519_priv = X25519PrivateKey.from_private_bytes(raw)
+                self.x25519_pub  = self.x25519_priv.public_key()
+                return
+            except Exception:
+                pass
+        self.x25519_priv = X25519PrivateKey.generate()
+        self.x25519_pub  = self.x25519_priv.public_key()
+        raw = self.x25519_priv.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+        pub = self.x25519_pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+        with open(x_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "private": base64.b64encode(raw).decode("ascii"),
+                "public":  base64.b64encode(pub).decode("ascii"),
+            }, f, indent=2)
+
+    def x25519_pub_b64(self):
+        pub = self.x25519_pub.public_bytes(Encoding.Raw, PublicFormat.Raw)
+        return base64.b64encode(pub).decode("ascii")
+
+    def clave_publica_b64(self):
+        # NOTA DE CORRECCIÓN: en versiones anteriores faltaba el "return" aquí,
+        # lo que rompía info() y la tarjeta QR con un AttributeError silencioso
+        # (la función devolvía None). Se corrige sin tocar nada más.
+        publica = self.public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+        return base64.b64encode(publica).decode("ascii")
+
+    def firmar(self, datos):
+        firma = self.private_key.sign(json_bytes(datos))
+        return base64.b64encode(firma).decode("ascii")
+
+
+# ============================================================
+# CIFRADO AUTENTICADO  (original intacto)
+# ============================================================
+
+class CryptoRET:
+
+    def __init__(self, secreto):
+        clave         = hashlib.sha256(secreto.encode("utf-8")).digest()
+        clave_fernet  = base64.urlsafe_b64encode(clave)
+        self.fernet   = Fernet(clave_fernet)
+
+    def cifrar(self, texto):
+        return self.fernet.encrypt(texto.encode("utf-8")).decode("ascii")
+
+    def descifrar(self, token):
+        return self.fernet.decrypt(token.encode("ascii")).decode("utf-8")
+
+
+# ============================================================
+# NUEVO: GUÍA RET  (inspirada en la Guía de Socxima)
+# ============================================================
+
+class GuiaRET:
+    """
+    Asistente local que anuncia los mensajes que te llegan y te ayuda a
+    redactar respuestas a partir de una instrucción en lenguaje natural
+    ("dile que voy mañana"). Nada de esto sale de tu dispositivo ni usa
+    ningún servicio externo — es solo un mapeo de frases a texto, igual
+    de soberano que el resto de RET.
+
+    La idea viene de la "Guía Socima" de un proyecto hermano (Socxima);
+    aquí se adapta al estilo y la arquitectura propios de RET, sin tocar
+    nada del núcleo de mensajería ya probado.
+    """
+
+    NOMBRE = "Guía"
+
+    def __init__(self):
+        self.voz_activada = os.environ.get("RET_GUIA_VOZ", "") == "1"
+
+    def anunciar_mensaje(self, origen_nombre, contenido):
+        """Muestra el mensaje entrante narrado por la Guía. Además del
+        texto en pantalla, intenta leerlo en voz si RET_GUIA_VOZ=1."""
+        texto = f"Te llegó un mensaje de {origen_nombre}: {contenido}"
+        print(f"\n{C.MAGENTA}🔊 [{self.NOMBRE}]{C.RESET} {texto}")
+        if self.voz_activada:
+            self.hablar(texto)
+
+    def redactar_respuesta(self, instruccion, remitente=""):
+        """
+        Traduce una instrucción en lenguaje natural a un mensaje
+        redactado, con las mismas reglas de la Guía original + un par
+        más. Si ninguna regla aplica, se manda la instrucción tal cual
+        (igual que hacía Socxima).
+        """
+        cmd = instruccion.lower()
+        saludo = f"Hola{f' {remitente}' if remitente else ''}, "
+
+        if "mañana" in cmd:
+            respuesta = saludo + "confirmo que voy mañana."
+        elif "no puedo" in cmd or "ocupado" in cmd or "ocupada" in cmd:
+            respuesta = saludo + "lo siento, no puedo asistir en este momento."
+        elif "en camino" in cmd or "llegando" in cmd:
+            respuesta = saludo + "ya voy en camino."
+        elif "gracias" in cmd:
+            respuesta = saludo + "¡gracias a ti!"
+        elif "de acuerdo" in cmd or "vale" in cmd or "está bien" in cmd:
+            respuesta = saludo + "de acuerdo, quedamos así."
+        else:
+            respuesta = instruccion
+
+        print(f"{C.MAGENTA}🔊 [{self.NOMBRE}]{C.RESET} Entendido. Redacté: \"{respuesta}\"")
+        return respuesta
+
+    def hablar(self, texto):
+        """
+        Intento de voz real (TTS), completamente opcional y silencioso
+        si no hay nada disponible — el mensaje ya se mostró en texto.
+        Prueba, en orden: Termux:API (Android), espeak (Linux), say (macOS).
+        """
+        import subprocess
+        for comando in (
+            ["termux-tts-speak", texto],
+            ["espeak", "-v", "es", texto],
+            ["say", texto],
+        ):
+            try:
+                subprocess.run(comando, timeout=10, capture_output=True)
+                return
+            except Exception:
+                continue
+
+
+# ============================================================
+# NÚCLEO RET  (original intacto)
+# ============================================================
+
+class RETNodo:
+
+    def __init__(self, nombre, puerto, secreto, modo="completo"):
+        self.nombre   = nombre
+        self.puerto   = puerto
+        self.modo     = modo if modo in MODOS_NODO_VALIDOS else "completo"
+        self.db       = BaseDatos(DB_PATH)
+        self.identidad = IdentidadNodo()
+        self.crypto   = CryptoRET(secreto)
+        self.guia     = GuiaRET()
+        self.iniciado = ahora_epoch()
+        self.activo   = True
+        self.db.set_estado("nombre", nombre)
+        self.db.set_estado("puerto", puerto)
+
+    def info(self):
+        return {
+            "sistema":    NOMBRE_SISTEMA,
+            "version":    VERSION,
+            "node_id":    self.identidad.node_id,
+            "nombre":     self.nombre,
+            "puerto":     self.puerto,
+            "modo":       self.modo,
+            "public_key": self.identidad.clave_publica_b64(),
+            "x25519_pub": self.identidad.x25519_pub_b64(),
+            "pin":        pin_nodo(self.identidad.node_id),
+            "timestamp":  ahora_epoch(),
+        }
+
+    def crear_paquete(self, destino, contenido, ttl=TTL_DEFAULT):
+        paquete_id = str(uuid.uuid4())
+        mensaje = {
+            "id":           paquete_id,
+            "tipo":         "MENSAJE",
+            "origen":       self.identidad.node_id,
+            "origen_nombre": self.nombre,
+            "destino":      destino,
+            "contenido":    contenido,
+            "ttl":          ttl,
+            "timestamp":    ahora_epoch(),
+        }
+        cifrado = self.crypto.cifrar(json.dumps(mensaje, ensure_ascii=False))
+        return {
+            "packet_id": paquete_id,
+            "tipo":      "PAQUETE_RET",
+            "_ret":      FIRMA_PROTOCOLO,
+            "origen":    self.identidad.node_id,
+            "ttl":       ttl,
+            "payload":   cifrado,
+            "timestamp": ahora_epoch(),
+        }
+
+    def procesar_paquete(self, paquete):
+        paquete_id = paquete.get("packet_id")
+        if not paquete_id:
+            return {"ok": False, "error": "packet_id ausente"}
+        if self.db.paquete_visto(paquete_id):
+            return {"ok": True, "duplicado": True, "packet_id": paquete_id}
+        ttl = paquete.get("ttl", 0)
+        if ttl <= 0:
+            return {"ok": False, "error": "TTL agotado"}
+        try:
+            plano   = self.crypto.descifrar(paquete["payload"])
+            mensaje = json.loads(plano)
+        except InvalidToken:
+            return {"ok": False, "error": "No se pudo autenticar o descifrar el paquete"}
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
+
+        self.db.marcar_paquete_visto(paquete_id)
+
+        contenido_raw    = mensaje.get("contenido", "")
+        contenido_mostrar = contenido_raw
+        es_e2e           = False
+
+        try:
+            meta = json.loads(contenido_raw)
+            if isinstance(meta, dict) and meta.get("e2e") and \
+               "efimera" in meta and "cifrado" in meta:
+                efimera_pub = X25519PublicKey.from_public_bytes(
+                    base64.b64decode(meta["efimera"])
+                )
+                secreto = self.identidad.x25519_priv.exchange(efimera_pub)
+                hkdf = HKDF(
+                    algorithm=crypto_hashes.SHA256(),
+                    length=32, salt=None, info=b"ret-e2e-v1",
+                )
+                clave_f = base64.urlsafe_b64encode(hkdf.derive(secreto))
+                texto   = Fernet(clave_f).decrypt(
+                    meta["cifrado"].encode("ascii")
+                ).decode("utf-8")
+                contenido_mostrar = texto
+                es_e2e = True
+        except Exception:
+            pass
+
+        self.db.guardar_mensaje(
+            paquete_id,
+            mensaje.get("origen"),
+            mensaje.get("destino"),
+            contenido_mostrar,
+            "ENTRANTE_E2E" if es_e2e else "ENTRANTE",
+        )
+        self.db.evento(
+            "MENSAJE_RECIBIDO",
+            f"{mensaje.get('origen')} -> {mensaje.get('destino')}"
+            + (" [E2E]" if es_e2e else ""),
+        )
+
+        print("")
+        print("========================================")
+        if es_e2e:
+            print("🔒 MENSAJE E2E RECIBIDO  (solo tú puedes leerlo)")
+        else:
+            print("📩 MENSAJE RET RECIBIDO")
+        print("========================================")
+        print("ID:",        paquete_id)
+        print("ORIGEN:",    mensaje.get("origen"))
+        print("DESTINO:",   mensaje.get("destino"))
+        print("CONTENIDO:", contenido_mostrar)
+        if es_e2e:
+            print("CIFRADO:    X25519 + HKDF + Fernet  ✅")
+        print("========================================")
+
+        # La Guía narra el mensaje entrante (ver clase GuiaRET) — puramente
+        # aditivo, no cambia nada del flujo de cifrado/ACK de arriba.
+        self.guia.anunciar_mensaje(
+            mensaje.get("origen_nombre") or mensaje.get("origen", "?"),
+            contenido_mostrar
+        )
+
+        return {
+            "ok":       True,
+            "tipo":     "ACK",
+            "packet_id": paquete_id,
+            "receptor": self.identidad.node_id,
+        }
+
+
+# ============================================================
+# NUEVO: COMPRESOR RET  (RLE + deflate, con verificación SHA-256)
+# ============================================================
+
+class CompresorRET:
+    """
+    Compresión con verificación de integridad, usada para achicar lo
+    que viaja por transportes lentos (Bluetooth clásico, ~1-3 Mbps) o
+    para exportar el estado del nodo sin que pese tanto.
+
+    Formato: RLE simple → deflate (zlib) → cabecera con SHA-256 del
+    original para detectar corrupción al descomprimir.
+
+    NOTA DE CORRECCIÓN: en la versión original, compress_data(b"")
+    devolvía bytes vacíos, pero decompress_data(b"") no manejaba ese
+    caso y lanzaba una excepción — una asimetría real, encontrada
+    probando el código, no solo leyéndolo. Se corrige aquí.
+    """
+
+    MAGIC   = b"RET1"
+    VERSION = 1
+    _FORMATO_CABECERA = "!4sH32sQI"
+
+    @staticmethod
+    def comprimir(data: bytes) -> bytes:
+        if not data:
+            return b""
+
+        rle = bytearray()
+        i, n = 0, len(data)
+        while i < n:
+            largo = 1
+            while i + largo < n and data[i] == data[i + largo] and largo < 255:
+                largo += 1
+            rle.append(largo)
+            rle.append(data[i])
+            i += largo
+
+        payload = zlib.compress(bytes(rle), level=9)
+        checksum = hashlib.sha256(data).digest()
+
+        cabecera = struct.pack(
+            CompresorRET._FORMATO_CABECERA,
+            CompresorRET.MAGIC, CompresorRET.VERSION,
+            checksum, len(data), len(payload)
+        )
+        return cabecera + payload
+
+    @staticmethod
+    def descomprimir(payload: bytes) -> bytes:
+        if not payload:
+            return b""   # simétrico con comprimir(b"") — antes esto lanzaba error
+
+        tam_cabecera = struct.calcsize(CompresorRET._FORMATO_CABECERA)
+        if len(payload) < tam_cabecera:
+            raise ValueError("Payload inválido: más corto que la cabecera RET1.")
+
+        magic, version, checksum, tam_original, tam_payload = struct.unpack(
+            CompresorRET._FORMATO_CABECERA, payload[:tam_cabecera]
+        )
+        if magic != CompresorRET.MAGIC:
+            raise ValueError(f"Cabecera inválida: {magic!r} (se esperaba {CompresorRET.MAGIC!r})")
+        if version != CompresorRET.VERSION:
+            raise ValueError(f"Versión de compresión no soportada: {version}")
+
+        datos_comprimidos = payload[tam_cabecera:tam_cabecera + tam_payload]
+        rle = zlib.decompress(datos_comprimidos)
+
+        original = bytearray()
+        i = 0
+        while i < len(rle):
+            largo = rle[i]
+            valor = rle[i + 1]
+            original.extend([valor] * largo)
+            i += 2
+
+        resultado = bytes(original)
+
+        if hashlib.sha256(resultado).digest() != checksum:
+            raise ValueError("Verificación de integridad falló — datos corruptos.")
+        if len(resultado) != tam_original:
+            raise ValueError("El tamaño descomprimido no coincide con el original.")
+
+        return resultado
+
+
+
+# ============================================================
+# NUEVO: TARJETA DE CONEXIÓN + CÓDIGO QR
+# ============================================================
+
+def fnv1a_32(datos: bytes) -> int:
+    """
+    FNV-1a de 32 bits — un hash simple y determinista, NO criptográfico
+    (para eso ya está Ed25519/X25519 en otro lado). Se usa solo para
+    convertir una clave pública en un patrón visual reproducible. La
+    misma implementación existe también en JavaScript (dashboard) byte
+    por byte, para que la huella se vea IDÉNTICA tanto en la tarjeta
+    HTML como en el navegador — si no coincidieran, la huella no
+    serviría para verificar nada.
+    """
+    h = 2166136261
+    for b in datos:
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def huella_hues(clave_b64: str, n: int = 6):
+    """Devuelve n matices de color (0-359°) derivados de una clave pública."""
+    base = clave_b64.encode("utf-8")
+    return [fnv1a_32(base + f":{i}".encode("utf-8")) % 360 for i in range(n)]
+
+
+def huella_svg(clave_b64: str, tam_hex: int = 20, n: int = 6, espaciado: int = 4) -> str:
+    """
+    Huella visual de identidad: una fila de hexágonos, cada uno con un
+    color derivado de la clave pública real del nodo. Dos nodos con
+    claves distintas casi con certeza se ven distintos; el mismo nodo
+    siempre genera exactamente el mismo patrón — sirve para comparar
+    a simple vista ("¿tus hexágonos son iguales a los míos?") en vez
+    de comparar cadenas largas de texto.
+    """
+    hues = huella_hues(clave_b64, n)
+    ancho_paso = tam_hex * 1.8 + espaciado
+    ancho_total = ancho_paso * n
+    alto_total = tam_hex * 2.2
+    partes = [f'<svg viewBox="0 0 {ancho_total:.0f} {alto_total:.0f}" '
+              f'xmlns="http://www.w3.org/2000/svg">']
+    for i, hue in enumerate(hues):
+        cx = ancho_paso * i + tam_hex
+        cy = alto_total / 2
+        r = tam_hex * 0.9
+        puntos = []
+        for k in range(6):
+            ang = math.pi / 180 * (60 * k - 30)
+            puntos.append(f"{cx + r*math.cos(ang):.1f},{cy + r*math.sin(ang):.1f}")
+        partes.append(
+            f'<polygon points="{" ".join(puntos)}" '
+            f'fill="hsl({hue},65%,50%)" stroke="#0d1117" stroke-width="1.5"/>'
+        )
+    partes.append("</svg>")
+    return "".join(partes)
+
+
+class TarjetaRET:
+    """
+    Tarjeta de conexión estilo 'código de entrenador' (Pokémon GO).
+
+    Codifica host, puerto y PIN del nodo en:
+      - Un código numérico de 12 dígitos (fácil de leer/dictar)
+      - Un QR real que, al escanearse, contiene el JSON de conexión
+      - Una tarjeta HTML para abrir en cualquier navegador sin internet
+
+    Otro nodo escanea el QR (o teclea el código) y se conecta directo,
+    sin escribir IP/puerto/PIN a mano.
+    """
+
+    def __init__(self, nodo):
+        self.nodo = nodo
+
+    def codigo_numerico(self):
+        h = hashlib.sha256(self.nodo.identidad.node_id.encode()).hexdigest()
+        valor = int(h[:16], 16) % (10 ** 12)
+        codigo = f"{valor:012d}"
+        return f"{codigo[0:4]} {codigo[4:8]} {codigo[8:12]}"
+
+    def payload_conexion(self):
+        return {
+            "ret":        FIRMA_PROTOCOLO,
+            "node_id":    self.nodo.identidad.node_id,
+            "nombre":     self.nodo.nombre,
+            "puerto":     self.nodo.puerto,
+            "ips":        mis_ips_locales(),
+            "public_key": self.nodo.identidad.clave_publica_b64(),
+            "x25519_pub": self.nodo.identidad.x25519_pub_b64(),
+            "pin":        pin_nodo(self.nodo.identidad.node_id),
+            "codigo":     self.codigo_numerico(),
+        }
+
+    def payload_b64(self):
+        datos = json.dumps(
+            self.payload_conexion(), ensure_ascii=False, separators=(",", ":")
+        )
+        return base64.urlsafe_b64encode(datos.encode("utf-8")).decode("ascii")
+
+    def generar_qr_png(self, ruta_salida):
+        if not QR_DISPONIBLE:
+            return None
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=8,
+            border=3,
+        )
+        qr.add_data("RET://" + self.payload_b64())
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        img.save(str(ruta_salida))
+        return ruta_salida
+
+    def qr_terminal(self):
+        if not QR_DISPONIBLE:
+            print("⚠️  Instala 'qrcode' para ver el QR: pip install qrcode[pil]")
+            return
+        qr = qrcode.QRCode(border=1)
+        qr.add_data("RET://" + self.payload_b64())
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+
+    def generar_html(self, ruta_salida, ruta_qr_png=None):
+        info = self.payload_conexion()
+        qr_tag = ""
+        if ruta_qr_png and Path(ruta_qr_png).exists():
+            qr_b64 = base64.b64encode(Path(ruta_qr_png).read_bytes()).decode("ascii")
+            qr_tag = f'<img class="qr" src="data:image/png;base64,{qr_b64}"/>'
+
+        huella_tag = huella_svg(info["public_key"])
+
+        html = f"""<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RET — Tarjeta de {info['nombre']}</title>
+<style>
+  body{{font-family:sans-serif;background:#0d1117;color:#e6edf3;
+       display:flex;justify-content:center;padding:24px}}
+  .tarjeta{{background:#161b22;border:1px solid #30363d;border-radius:16px;
+           padding:28px;max-width:360px;text-align:center}}
+  h1{{color:#58a6ff;font-size:1.2em;margin-bottom:4px}}
+  .codigo{{font-size:1.4em;letter-spacing:2px;color:#3fb950;
+          margin:16px 0;font-family:monospace}}
+  .qr{{width:220px;height:220px;background:#fff;padding:10px;
+      border-radius:8px;margin:10px 0}}
+  .pin{{color:#d29922;font-size:.9em}}
+  .ips{{color:#8b949e;font-size:.75em;margin-top:10px}}
+  .huella{{margin:14px 0 4px}}
+  .huella svg{{height:28px}}
+  .huella-etiqueta{{color:#8b949e;font-size:.68em;margin-top:4px}}
+</style></head>
+<body>
+  <div class="tarjeta">
+    <h1>⬡ {info['nombre']}</h1>
+    <div class="codigo">{info['codigo']}</div>
+    {qr_tag}
+    <div class="huella">{huella_tag}</div>
+    <div class="huella-etiqueta">Huella de identidad — compárala con la del otro nodo</div>
+    <div class="pin">PIN: {info['pin']}</div>
+    <div class="ips">{' · '.join(info['ips'])}:{info['puerto']}</div>
+  </div>
+</body></html>"""
+        Path(ruta_salida).write_text(html, encoding="utf-8")
+        return ruta_salida
+
+    def mostrar_y_guardar(self, carpeta_base):
+        carpeta_base = Path(carpeta_base)
+        print("\n" + "=" * 44)
+        print("  CÓDIGO DE NODO RET")
+        print("=" * 44)
+        print(f"  {self.codigo_numerico()}")
+        print("=" * 44)
+        self.qr_terminal()
+
+        ruta_png = carpeta_base / "ret_tarjeta_qr.png"
+        self.generar_qr_png(ruta_png)
+        ruta_html = carpeta_base / "ret_tarjeta.html"
+        self.generar_html(ruta_html, ruta_png if QR_DISPONIBLE else None)
+
+        print(f"\n📇 Tarjeta HTML: {ruta_html}")
+        if QR_DISPONIBLE:
+            print(f"🖼️  QR imagen:   {ruta_png}")
+        else:
+            print("⚠️  Para el QR como imagen: pip install qrcode[pil]")
+
+    @staticmethod
+    def leer_payload(texto):
+        if texto.startswith("RET://"):
+            texto = texto[len("RET://"):]
+        datos = base64.urlsafe_b64decode(texto.encode("ascii"))
+        return json.loads(datos.decode("utf-8"))
+
+
+# ============================================================
+# NUEVO P2P: DHT KADEMLIA SIMPLIFICADO
+# ============================================================
+
+class DHTRET:
+    """
+    Tabla Hash Distribuida inspirada en Kademlia.
+    Con 1,000,000 nodos = 20 saltos máximo para localizar cualquiera.
+    Con 1,000,000,000 nodos = 30 saltos máximo.
+  
